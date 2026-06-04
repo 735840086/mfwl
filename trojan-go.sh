@@ -28,7 +28,7 @@ if [[ "$res" != "" ]]; then
 fi
 
 # 以下网站是随机从Google上找到的无广告小说网站，不喜欢请改成其他网址，以http或https开头
-# 搭建好后无法打开伪装域名，可能是反代小说网站挂了，请在网站留言，或者Github发issue，以便替换新的网站
+# 搭建好后无法打开伪装域名，可能是反代小说网站挂了
 SITES=(
 http://www.zhuizishu.com/
 http://xs.56dyc.com/
@@ -173,8 +173,8 @@ getData() {
     echo ""
     can_change=$1
     if [[ "$can_change" != "yes" ]]; then
-        echo " trojan-go一键脚本，运行之前请确认如下条件已经具备："
-        echo -e "  ${RED}1. 一个伪装域名${PLAIN}"
+        echo " trojan-go部署脚本，运行前请确认条件已具备："
+        echo -e "  ${RED}1. 伪装域名${PLAIN}"
         echo -e "  ${RED}2. 伪装域名DNS解析指向当前服务器ip（${IP}）${PLAIN}"
         echo -e "  3. 如果/root目录下有 ${GREEN}trojan-go.pem${PLAIN} 和 ${GREEN}trojan-go.key${PLAIN} 证书密钥文件，无需理会条件2"
         echo " "
@@ -186,7 +186,7 @@ getData() {
         echo ""
         while true
         do
-            read -p " 请输入伪装域名：" DOMAIN
+            read -p " 输入伪装域名：" DOMAIN
             if [[ -z "${DOMAIN}" ]]; then
                 echo -e " ${RED}伪装域名输入错误，请重新输入！${PLAIN}"
             else
@@ -221,7 +221,7 @@ getData() {
     fi
 
     echo ""
-    read -p " 请设置trojan-go密码（不输则随机生成）:" PASSWORD
+    read -p " 设置trojan-go密码（不输则随机生成）:" PASSWORD
     [[ -z "$PASSWORD" ]] && PASSWORD=`cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1`
     colorEcho $BLUE " trojan-go密码：$PASSWORD"
     echo ""
@@ -231,7 +231,7 @@ getData() {
         if [[ ${answer,,} = "n" ]]; then
             break
         fi
-        read -p " 请设置trojan-go密码（不输则随机生成）:" pass
+        read -p " 设置trojan-go密码（不输则随机生成）:" pass
         [[ -z "$pass" ]] && pass=`cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1`
         echo ""
         colorEcho $BLUE " trojan-go密码：$pass"
@@ -239,8 +239,8 @@ getData() {
     done
 
     echo ""
-    read -p " 请输入trojan-go端口[100-65535的一个数字，默认443]：" PORT
-    [[ -z "${PORT}" ]] && PORT=443
+    read -p " 输入trojan-go端口[100-65535的一个数字，默认13888]：" PORT
+    [[ -z "${PORT}" ]] && PORT=13888
     if [[ "${PORT:0:1}" = "0" ]]; then
         echo -e "${RED}端口不能以0开头${PLAIN}"
         exit 1
@@ -251,7 +251,7 @@ getData() {
         echo ""
         while true
         do
-            read -p " 请输入伪装路径，以/开头(不懂请直接回车)：" WSPATH
+            read -p " 输入伪装路径，以/开头(不懂直接回车)：" WSPATH
             if [[ -z "${WSPATH}" ]]; then
                 len=`shuf -i5-12 -n1`
                 ws=`cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w $len | head -n 1`
@@ -270,13 +270,13 @@ getData() {
     fi
 
     echo ""
-    colorEcho $BLUE " 请选择伪装站类型:"
+    colorEcho $BLUE " 选择伪装站类型:"
     echo "   1) 静态网站(位于/usr/share/nginx/html)"
     echo "   2) 小说站(随机选择)"
     echo "   3) 美女站(https://imeizi.me)"
     echo "   4) 高清壁纸站(https://bing.imeizi.me)"
     echo "   5) 自定义反代站点(需以http或者https开头)"
-    read -p "  请选择伪装网站类型[默认:高清壁纸站]" answer
+    read -p "  选择伪装网站类型[默认:高清壁纸站]" answer
     if [[ -z "$answer" ]]; then
         PROXY_URL="https://bing.imeizi.me"
     else
@@ -307,7 +307,7 @@ getData() {
             PROXY_URL="https://bing.imeizi.me"
             ;;
         5)
-            read -p " 请输入反代站点(以http或者https开头)：" PROXY_URL
+            read -p " 输入反代站点(以http或者https开头)：" PROXY_URL
             if [[ -z "$PROXY_URL" ]]; then
                 colorEcho $RED " 请输入反代网站！"
                 exit 1
@@ -327,8 +327,8 @@ getData() {
 
     echo ""
     colorEcho $BLUE " 是否允许搜索引擎爬取网站？[默认：不允许]"
-    echo "    y)允许，会有更多ip请求网站，但会消耗一些流量，vps流量充足情况下推荐使用"
-    echo "    n)不允许，爬虫不会访问网站，访问ip比较单一，但能节省vps流量"
+    echo "    y)允许，更多ip请求网站，多消耗流量，vps流量充足推荐使用"
+    echo "    n)不允许，爬虫不访问网站，访问ip单一，节省vps流量"
     read -p "  请选择：[y/n]" answer
     if [[ -z "$answer" ]]; then
         ALLOW_SPIDER="n"
@@ -403,9 +403,9 @@ getCert() {
         stopNginx
         systemctl stop trojan-go
         sleep 2
-        res=`ss -ntlp| grep -E ':80 |:443 '`
+        res=`ss -ntlp| grep -E ':80 |:13888 '`
         if [[ "${res}" != "" ]]; then
-            echo -e "${RED} 其他进程占用了80或443端口，请先关闭再运行一键脚本${PLAIN}"
+            echo -e "${RED} 其他进程占用了80或13888端口，请先关闭再运行一键脚本${PLAIN}"
             echo " 端口占用信息如下："
             echo ${res}
             exit 1
@@ -431,7 +431,7 @@ getCert() {
             ~/.acme.sh/acme.sh   --issue -d $DOMAIN --keylength ec-256 --pre-hook "nginx -s stop || { echo -n ''; }" --post-hook "nginx -c /www/server/nginx/conf/nginx.conf || { echo -n ''; }"  --standalone
         fi
         [[ -f ~/.acme.sh/${DOMAIN}_ecc/ca.cer ]] || {
-            colorEcho $RED " 获取证书失败，请复制上面的红色文字到 https://hijk.art 反馈"
+            colorEcho $RED " 获取证书失败"
             exit 1
         }
         CERT_FILE="/etc/trojan-go/${DOMAIN}.pem"
@@ -441,7 +441,7 @@ getCert() {
             --fullchain-file $CERT_FILE \
             --reloadcmd     "service nginx force-reload"
         [[ -f $CERT_FILE && -f $KEY_FILE ]] || {
-            colorEcho $RED " 获取证书失败，请到 https://hijk.art 反馈"
+            colorEcho $RED " 获取证书失败"
             exit 1
         }
     else
@@ -833,7 +833,7 @@ start() {
     port=`grep local_port $CONFIG_FILE|cut -d: -f2| tr -d \",' '`
     res=`ss -ntlp| grep ${port} | grep trojan-go`
     if [[ "$res" = "" ]]; then
-        colorEcho $RED " trojan-go启动失败，请检查端口是否被占用！"
+        colorEcho $RED " trojan-go启动失败，检查端口是否占用！"
     else
         colorEcho $BLUE " trojan-go启动成功"
     fi
@@ -926,12 +926,12 @@ showLog() {
 menu() {
     clear
     echo "#############################################################"
-    echo -e "#                    ${RED}trojan-go一键安装脚本${PLAIN}                  #"
-    echo -e "# ${GREEN}作者${PLAIN}: 网络跳越(hijk)                                      #"
-    echo -e "# ${GREEN}网址${PLAIN}: https://hijk.art                                    #"
-    echo -e "# ${GREEN}论坛${PLAIN}: https://hijk.club                                   #"
-    echo -e "# ${GREEN}TG群${PLAIN}: https://t.me/hijkclub                               #"
-    echo -e "# ${GREEN}Youtube频道${PLAIN}: https://youtube.com/channel/UCYTB--VsObzepVJtc9yvUxQ #"
+    echo -e "#                    ${RED}trojan-go一键部署脚本${PLAIN}                  #"
+    echo -e "# ${GREEN}作者${PLAIN}: hhroot #"
+    echo -e "# ${GREEN}网址${PLAIN}: https://github.com/735840086 #"
+    echo -e "# ${GREEN}---${PLAIN}: ------ #"
+    echo -e "# ${GREEN}whcat${PLAIN}: 735840086 #"
+    echo -e "# ${GREEN}---${PLAIN}: ----#"
     echo "#############################################################"
     echo ""
 
