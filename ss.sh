@@ -55,6 +55,14 @@ PM=""
 INSTALL_BBR="false"
 DL_USED=""
 
+# v3.3.6 在 .gitmodules 里记录的三个子模块 commit（用固定 commit 而不是 master，
+# master 上的 libcork 缺少已提交的 config/version.h，会直接编译失败）
+declare -A SUBMODULE_PIN_336=(
+    [libcork]=074e074b26e9e372e90e6ade215217763c8644aa
+    [libipset]=bc1qeleffvl3puy7nezjfwtndvd6uf0rytluy7s6g2
+    [libbloom]=437e1add5a2b9a87797d8c648df7cf5f3ee155a8
+)
+
 # ---------------------------------------------------------------- 输出函数
 colorEcho() {
     local color="$1"
@@ -173,14 +181,26 @@ swap_total_mb() {
     echo $(( ${kb:-0} / 1024 ))
 }
 
+swap_free_mb() {
+    local kb
+    kb="$(awk '/^SwapFree:/{print $2}' /proc/meminfo 2>/dev/null)"
+    echo $(( ${kb:-0} / 1024 ))
+}
+
+# 建了 Swap 之后 MemAvailable 不会变大，判断要按「可用内存 + 空闲 Swap」算
+effective_mem_mb() {
+    echo $(( $(avail_mem_mb) + $(swap_free_mb) ))
+}
+
 ensure_memory() {
     # 512MB 小机器上 apt / 编译都可能被 OOM Killer 直接 SIGKILL（截断日志、报错却查不出原因）
-    local avail swap ans size
+    local avail swap ans size eff
     avail="$(avail_mem_mb)"
     swap="$(swap_total_mb)"
-    info " 可用内存 ${avail} MB，Swap ${swap} MB"
+    eff="$(effective_mem_mb)"
+    info " 可用内存 ${avail} MB，Swap ${swap} MB（合计可用 ${eff} MB）"
 
-    if (( avail >= 600 )); then return 0; fi
+    if (( eff >= 600 )); then return 0; fi
     if (( swap >= 512 )); then
         warn " 内存偏紧（${avail} MB），已有 Swap ${swap} MB，继续（编译会较慢）"
         return 0
@@ -216,7 +236,7 @@ ensure_memory() {
             warn " Swap 文件创建失败（磁盘空间不足？）"
         fi
     fi
-    info " 当前可用内存 $(avail_mem_mb) MB，Swap $(swap_total_mb) MB"
+    info " 当前可用内存 $(avail_mem_mb) MB，Swap $(swap_total_mb) MB（合计 $(effective_mem_mb) MB）"
     return 0
 }
 
@@ -463,9 +483,32 @@ detect_build_system() {
 # v3.3.6 改用 CMake，但 GitHub 的 release 源码包不含子模块，
 # libcork / libipset / libbloom 三个目录是空的，直接 cmake 会报：
 #   CMake Error at CMakeLists.txt:175 (add_library): No SOURCES given to target: bloom
+# libcork 的 config/version.h 由 autotools 的 configure 从 version.h.in 生成，
+# 某些 commit（如 master）里没有提交生成结果，会报 `libcork/config/version.h: No such file`
+ensure_libcork_version_h() {
+    local cork="$1" inc="$1/include/libcork/config"
+    local ver="" maj="" min="" pat=""
+    [[ -f "$inc/version.h" ]] && return 0
+    [[ -f "$inc/version.h.in" ]] || return 0
+    [[ -s "$cork/RELEASE-VERSION" ]] && ver="$(tr -d '[:space:]' < "$cork/RELEASE-VERSION")"
+    ver="${ver#v}"
+    if [[ "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+        maj="${BASH_REMATCH[1]}"; min="${BASH_REMATCH[2]}"; pat="${BASH_REMATCH[3]}"
+    else
+        ver="0.15.0"; maj=0; min=15; pat=0
+    fi
+    sed -e "s/@VERSION_MAJOR@/${maj}/" -e "s/@VERSION_MINOR@/${min}/" \
+        -e "s/@VERSION_PATCH@/${pat}/" -e "s/@VERSION@/${ver}/" \
+        -e "s/@GIT_SHA1@/unknown/" "$inc/version.h.in" > "$inc/version.h" 2>>"$LOG_FILE" \
+        && info " 生成 libcork/config/version.h（${ver}）" \
+        || { err " 生成 libcork/config/version.h 失败"; return 1; }
+    return 0
+}
+
 prepare_submodules() {
     log_ready
-    local dir="$1" spec name repo dest
+    local dir="$1" ver="${2-}" spec name repo dest ref
+    # 目录名:仓库名 —— 注意 libipset 目录对应的仓库叫 ipset
     for spec in "libcork:libcork" "libipset:ipset" "libbloom:libbloom"; do
         name="${spec%%:*}"
         repo="shadowsocks/${spec##*:}"
@@ -473,9 +516,14 @@ prepare_submodules() {
         if find "$dest" -type f 2>/dev/null | grep -q .; then
             continue
         fi
-        info " 补齐子模块 ${name}（release 包内为空目录）"
+        # 优先用 tag 里记录的固定 commit；master 会漂移（libcork master 已缺 version.h）
+        ref="master"
+        if [[ -n "${SUBMODULE_PIN_336[$name]-}" ]] && [[ -z "$ver" || "$ver" == 3.3.6 ]]; then
+            ref="${SUBMODULE_PIN_336[$name]}"
+        fi
+        info " 补齐子模块 ${name}（release 包内为空目录，来源 ${repo}@${ref:0:8}）"
         mkdir -p "$dest"
-        if ! gh_download "${repo}/archive/refs/heads/master.tar.gz" "${dir}/.${name}.tar.gz"; then
+        if ! gh_download "${repo}/archive/${ref}.tar.gz" "${dir}/.${name}.tar.gz"; then
             err " 子模块 ${name} 下载失败"
             return 1
         fi
@@ -484,6 +532,7 @@ prepare_submodules() {
             return 1
         fi
         rm -f "${dir}/.${name}.tar.gz"
+        [[ "$name" == "libcork" ]] && { ensure_libcork_version_h "$dest" || return 1; }
     done
     local f ok=1
     for f in "libcork/src/libcork/core/allocator.c" \
@@ -536,10 +585,10 @@ install_deps_autotools() {
 }
 
 install_deps_cmake() {
-    info " 安装 CMake 构建依赖（libev / libsodium / c-ares / mbedtls / pcre2）"
+    info " 安装 CMake 构建依赖（libev / libsodium / c-ares / mbedtls / pcre2 / glib）"
     case "$PM" in
-        apt) pkg_install cmake libev-dev libsodium-dev libc-ares-dev libmbedtls-dev libpcre2-dev || return 1 ;;
-        *)   pkg_install cmake libev-devel libsodium-devel c-ares-devel mbedtls-devel pcre2-devel || return 1 ;;
+        apt) pkg_install cmake libev-dev libsodium-dev libc-ares-dev libmbedtls-dev libpcre2-dev libglib2.0-dev || return 1 ;;
+        *)   pkg_install cmake libev-devel libsodium-devel c-ares-devel mbedtls-devel pcre2-devel glib2-devel || return 1 ;;
     esac
     return 0
 }
@@ -549,7 +598,7 @@ _build() {
     log_ready
     local dir="$1" bs="$2" jobs avail
     jobs="$(nproc 2>/dev/null || echo 2)"
-    avail="$(avail_mem_mb)"
+    avail="$(effective_mem_mb)"
     # 小内存机器并行编译容易 OOM，按可用内存收敛并发
     if (( avail < 1024 )); then
         jobs=1
@@ -558,7 +607,7 @@ _build() {
     elif (( jobs > 4 )); then
         jobs=4
     fi
-    info " 编译并发: -j${jobs}（可用内存 ${avail} MB）"
+    info " 编译并发: -j${jobs}（可用内存+Swap ${avail} MB）"
     case "$bs" in
         autotools)
             info " 构建方式: autotools (configure)"
@@ -623,7 +672,7 @@ install_from_source() {
             ;;
         cmake)
             install_deps_cmake || { rm -rf "$work"; return 1; }
-            prepare_submodules "$dir" || {
+            prepare_submodules "$dir" "$ver" || {
                 err " 子模块补齐失败，v${ver} 无法用 CMake 构建"
                 rm -rf "$work"
                 return 1
