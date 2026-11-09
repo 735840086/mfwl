@@ -17,6 +17,7 @@
 #   bash mtproxy.sh logs            看日志
 #   bash mtproxy.sh check-tg        检测到 Telegram 的连通性
 #   bash mtproxy.sh uninstall       卸载
+#   bash mtproxy.sh doctor          环境诊断（目录/配置/systemd/日志）
 #   bash mtproxy.sh selftest        本地自检（不联网、不改系统）
 #
 # 非交互安装：
@@ -31,7 +32,22 @@ set -uo pipefail
 # 基础路径 / 全局变量
 # ---------------------------------------------------------------------------
 SELF_NAME=$(basename -- "$0")
-SCRIPT_DIR=${MTPROXY_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd)}
+SCRIPT_DIR=${MTPROXY_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd -P)}
+# 脚本放在 / 或系统 bin 目录下时，BIN_DIR 会变成 /bin、配置写到 /config，
+# systemd 的 ExecStart 也会拼出 //xxx 这种路径 —— 直接拦掉，要求独立目录
+if [[ -z "${MTPROXY_HOME:-}" ]]; then
+    case "$SCRIPT_DIR" in
+        /|/bin|/sbin|/usr/bin|/usr/sbin|/etc|/usr|/usr/local/bin)
+            printf '\033[31m[ERROR]\033[0m 脚本不能放在 %s 下运行（会把程序装进系统目录）。\n' "$SCRIPT_DIR" >&2
+            printf '请放到独立目录，例如：\n  mkdir -p /root/mtproxy && cd /root/mtproxy\n  bash mtproxy-fixed.sh\n' >&2
+            exit 1
+            ;;
+    esac
+    if [[ ! -w "$SCRIPT_DIR" ]]; then
+        printf '\033[31m[ERROR]\033[0m 目录不可写：%s（需要 root 或换目录）\n' "$SCRIPT_DIR" >&2
+        exit 1
+    fi
+fi
 BIN_DIR="$SCRIPT_DIR/bin"
 RUN_DIR="$SCRIPT_DIR/runtime"
 LOG_DIR="$RUN_DIR/log"
@@ -546,7 +562,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$SCRIPT_DIR
-ExecStart=/bin/bash "$SCRIPT_DIR/$SELF_NAME" __run
+ExecStart=/bin/bash "${SCRIPT_DIR}/${SELF_NAME}" __run
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
@@ -557,6 +573,17 @@ EOF
     systemctl daemon-reload >>"$RUN_LOG" 2>&1
     systemctl enable "$UNIT_NAME" >>"$RUN_LOG" 2>&1
     return 0
+}
+
+systemd_diag() {
+    # 启动失败时把真正的原因打出来，而不是只丢一句「未处于 active」
+    command -v systemctl >/dev/null 2>&1 || return 0
+    printf '\n%s--- systemctl status ---%s\n' "$C_GRAY" "$C_END" >&2
+    systemctl status "$UNIT_NAME" --no-pager -l 2>&1 | tail -n 15 >&2
+    printf '%s--- journal (最近 20 行) ---%s\n' "$C_GRAY" "$C_END" >&2
+    journalctl -u "$UNIT_NAME" -n 20 --no-pager 2>&1 | tail -n 20 >&2
+    printf '%s--- unit 文件 ---%s\n' "$C_GRAY" "$C_END" >&2
+    sed -n '1,20p' "$UNIT_PATH" >&2 2>/dev/null || true
 }
 
 systemd_remove() {
@@ -570,31 +597,8 @@ systemd_remove() {
 # ---------------------------------------------------------------------------
 # 启停
 # ---------------------------------------------------------------------------
-start_mtp() {
-    need_root start
-    ensure_deps
-    load_config || die "配置不存在，请先运行：bash $SELF_NAME install"
-
-    if use_systemd; then
-        systemd_install || die "写入 systemd 单元失败"
-        # 先清掉可能残留的 nohup 进程，避免两个实例抢端口
-        stop_mtp_quiet
-        systemctl start "$UNIT_NAME" >>"$RUN_LOG" 2>&1 || {
-            err "systemd 启动失败，最近日志："
-            journalctl -u "$UNIT_NAME" -n 20 --no-pager 2>/dev/null || tail -n 20 "$RUN_LOG"
-            return 1
-        }
-        sleep 1
-        if systemctl is-active --quiet "$UNIT_NAME"; then
-            info "已通过 systemd 启动（开机自启已开启）"
-            print_link
-            return 0
-        fi
-        err "systemd 已执行但服务未处于 active，请查看：journalctl -u $UNIT_NAME -n 50"
-        return 1
-    fi
-
-    # 无 systemd：nohup + pid 文件
+# nohup 后台方式（无 systemd，或 systemd 起不来时的降级路径）
+start_nohup() {
     if is_running; then
         warn "已经在运行（pid $(cat "$PID_FILE" 2>/dev/null)），如需重载配置请 restart"
         return 0
@@ -602,22 +606,58 @@ start_mtp() {
     kill_port_owner "$PORT" || return 1
     kill_port_owner "$ADMIN_PORT" || return 1
     get_public_ip >/dev/null 2>&1 || warn "取不到公网 IP"
-    build_run_cmd || die "缺少运行文件，请先 install"
+    load_config
+    build_run_cmd || { err "缺少运行文件，请先 install"; return 1; }
     ensure_dirs
     nohup "${RUN_CMD[@]}" >>"$RUN_LOG" 2>&1 &
     echo $! >"$PID_FILE"
     sleep 2
     if is_running; then
-        info "已启动（pid $(cat "$PID_FILE")）"
+        info "已启动（pid $(cat "$PID_FILE")，nohup 方式，重启机器后需手动 start）"
         print_link
         return 0
     fi
     err "启动失败，最近日志："
-    tail -n 20 "$RUN_LOG"
+    tail -n 20 "$RUN_LOG" >&2
     rm -f "$PID_FILE"
     return 1
 }
 
+start_mtp() {
+    need_root start
+    ensure_deps
+    load_config || die "配置不存在，请先运行：bash $SELF_NAME install"
+
+    if use_systemd; then
+        systemd_install || { warn "写入 systemd 单元失败，改用 nohup"; start_nohup; return $?; }
+        # 先清掉可能残留的 nohup 进程，避免两个实例抢端口
+        stop_mtp_quiet
+        if systemctl start "$UNIT_NAME" >>"$RUN_LOG" 2>&1; then
+            # Type=simple 下 active 会很快出现，但给 4 秒兜住启动竞态
+            for _ in 1 2 3 4; do
+                systemctl is-active --quiet "$UNIT_NAME" && break
+                sleep 1
+            done
+            if systemctl is-active --quiet "$UNIT_NAME"; then
+                info "已通过 systemd 启动（开机自启已开启）"
+                print_link
+                return 0
+            fi
+            err "systemd 报了成功，但服务随后退出（多半是配置/端口/二进制问题）"
+        else
+            err "systemd 启动命令返回失败"
+        fi
+
+        systemd_diag
+        warn "systemd 托管失败，已自动降级为 nohup 前台进程（不会开机自启）"
+        # 单元留着会一直失败重启，先停掉再降级
+        systemctl stop "$UNIT_NAME" >/dev/null 2>&1 || true
+        start_nohup
+        return $?
+    fi
+
+    start_nohup
+}
 stop_mtp_quiet() {
     if unit_exists && have_systemd; then
         systemctl stop "$UNIT_NAME" >>"$RUN_LOG" 2>&1 || true
@@ -1067,8 +1107,48 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 菜单
+# 环境诊断（出问题时一条命令看全）
 # ---------------------------------------------------------------------------
+doctor() {
+    line
+    printf '  %s环境诊断%s\n' "$C_BOLD" "$C_END"
+    line
+    printf '脚本目录   : %s\n' "$SCRIPT_DIR"
+    printf '配置       : %s\n' "$CONFIG_FILE"
+    [[ -f "$CONFIG_FILE" ]] && printf '配置权限   : %s\n' "$(stat -c %a "$CONFIG_FILE" 2>/dev/null || echo '?')"
+    printf 'bin 目录   : %s\n' "$BIN_DIR"
+    if [[ -d "$BIN_DIR" ]]; then
+        printf 'bin 内容   : %s\n' "$(ls -1 "$BIN_DIR" 2>/dev/null | tr '\n' ' ')"
+    fi
+    printf '运行目录   : %s\n' "$RUN_DIR"
+    if load_config 2>/dev/null; then
+        printf '当前配置   : 端口 %s / 管理 %s / 域名 %s / 实现 %s\n' \
+            "$PORT" "$ADMIN_PORT" "$DOMAIN" "$(provider_name "$PROVIDER")"
+        printf '端口监听   : %s\n' "$(port_pids "$PORT" | tr -d '\n' | sed 's/^/pid /')"
+        printf '管理端口   : %s\n' "$(port_pids "$ADMIN_PORT" 2>/dev/null | tr -d '\n' | sed 's/^/pid /')"
+    else
+        printf '当前配置   : %s未安装%s\n' "$C_YELLOW" "$C_END"
+    fi
+    if have_systemd; then
+        printf 'systemd    : 单元%s存在%s，状态 %s\n' \
+            "$([[ -f "$UNIT_PATH" ]] && echo '' || echo '不')" '' \
+            "$(systemctl is-active "$UNIT_NAME" 2>/dev/null || echo '未启动')"
+    else
+        printf 'systemd    : 本机没有 systemd（使用 nohup）\n'
+    fi
+    printf '公网 IP    : %s（缓存 %s）\n' "${PUBLIC_IP:-未知}" "$IP_CACHE"
+    echo
+    if [[ -f "$UNIT_PATH" ]]; then
+        systemd_diag
+    fi
+    if [[ -f "$RUN_LOG" ]]; then
+        printf '%s--- %s 最后 15 行 ---%s\n' "$C_GRAY" "$RUN_LOG" "$C_END"
+        tail -n 15 "$RUN_LOG" 2>/dev/null
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 菜单
 menu() {
     local opt
     banner() {
@@ -1175,6 +1255,7 @@ main() {
         uninstall)   uninstall ;;
         __run)       do_run_foreground ;;
         selftest)    selftest ;;
+        doctor|diag) doctor ;;
         debug)
             load_config || die "还没安装"
             build_run_cmd || die "缺少运行文件"
