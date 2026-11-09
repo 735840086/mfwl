@@ -63,6 +63,31 @@ declare -A SUBMODULE_PIN_336=(
     [libbloom]=437e1add5a2b9a87797d8c648df7cf5f3ee155a8
 )
 
+# 一个 ref 只可能是 40 位 sha 或者分支名；任何其它形态（被篡改、粘贴串行、截断）
+# 一律不采用，改为动态解析 —— 否则会拿一个乱码去拼 URL，必然 404
+is_sha40() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
+
+# 解析某版本 tag 下某个子模块目录对应的 commit：
+# 内置表(已校验) → GitHub API → 仓库 tree 页面 → master
+resolve_submodule_ref() {
+    local name="$1" tag="$2" ref="${SUBMODULE_PIN_336[$1]-}" html=""
+    # git tag 是 v3.3.6，API 的 ref 也必须带 v，否则 404 → 白白退回 master
+    [[ "$tag" == v* ]] || tag="v${tag}"
+    is_sha40 "$ref" || ref=""
+    if [[ -z "$ref" ]]; then
+        ref="$(curl -fsSL -H "User-Agent: ${UA}" --connect-timeout 8 --max-time 20 \
+                "https://api.github.com/repos/shadowsocks/shadowsocks-c/contents/${name}?ref=${tag}" 2>/dev/null \
+              | grep -oE '"sha": *"[0-9a-f]{40}"' | head -1 | grep -oE '[0-9a-f]{40}')"
+    fi
+    if ! is_sha40 "$ref"; then
+        html="$(curl -fsSL -H "User-Agent: ${UA}" --connect-timeout 8 --max-time 20 \
+                 "https://github.com/shadowsocks/shadowsocks-c/tree/${tag}/${name}" 2>/dev/null)"
+        ref="$(printf '%s' "$html" | grep -oE "/shadowsocks/shadowsocks-c/tree/[0-9a-f]{40}/${name}" | head -1 | grep -oE '[0-9a-f]{40}')"
+    fi
+    is_sha40 "$ref" || ref="master"
+    printf '%s\n' "$ref"
+}
+
 # ---------------------------------------------------------------- 输出函数
 colorEcho() {
     local color="$1"
@@ -505,27 +530,82 @@ ensure_libcork_version_h() {
     return 0
 }
 
+# 兜底：v3.3.5 的 release 包里子模块是「已填充」的（dist 归档），
+# 万一固定 commit 拉不到，可以直接借用它的三个子模块目录
+submodules_from_335() {
+    local dir="$1" refdir="$1/../.ss335-$$" f
+    info " 改从 v3.3.5 归档借用子模块源码"
+    mkdir -p "$refdir"
+    if ! gh_download "shadowsocks/shadowsocks-libev/releases/download/v3.3.5/shadowsocks-libev-3.3.5.tar.gz" "${refdir}/v335.tar.gz"; then
+        err " v3.3.5 归档下载失败，无法借用子模块"
+        rm -rf "$refdir"; return 1
+    fi
+    tar xzf "${refdir}/v335.tar.gz" --strip-components=1 -C "$refdir" 2>>"$LOG_FILE" || {
+        err " v3.3.5 归档解压失败"; rm -rf "$refdir"; return 1; }
+    for f in libcork libipset libbloom; do
+        if find "${refdir}/${f}" -type f 2>/dev/null | grep -q .; then
+            rm -rf "${dir:?}/${f}"
+            mkdir -p "${dir}/${f}"
+            cp -a "${refdir}/${f}/." "${dir}/${f}/" 2>>"$LOG_FILE" \
+                && info " 已从 v3.3.5 借用 ${f}" \
+                || { err " 借用 ${f} 失败"; rm -rf "$refdir"; return 1; }
+        fi
+    done
+    ensure_libcork_version_h "${dir}/libcork" || true
+    # v3.3.5 的 libcork 没有 core/version.c（3.3.6 的 CMake 会编译它），就地补一个
+    if [[ ! -f "${dir}/libcork/src/libcork/core/version.c" ]]; then
+        cat > "${dir}/libcork/src/libcork/core/version.c" <<'VERSIONC'
+/* v3.3.5 归档未带此文件，按 3.3.6 的定义补齐 */
+#include "libcork/config.h"
+#include "libcork/core/api.h"
+
+const char *
+cork_version_string(void)
+{
+    return CORK_CONFIG_VERSION_STRING;
+}
+
+const char *
+cork_revision_string(void)
+{
+    return CORK_CONFIG_REVISION;
+}
+VERSIONC
+        info " 补写 libcork/core/version.c"
+    fi
+    rm -rf "$refdir"
+    return 0
+}
+
 prepare_submodules() {
     log_ready
-    local dir="$1" ver="${2-}" spec name repo dest ref
+    local dir="$1" ver="${2-}" spec name repo dest ref alt
     # 目录名:仓库名 —— 注意 libipset 目录对应的仓库叫 ipset
     for spec in "libcork:libcork" "libipset:ipset" "libbloom:libbloom"; do
         name="${spec%%:*}"
-        repo="shadowsocks/${spec##*:}"
+        repo="${spec##*:}"
         dest="${dir}/${name}"
         if find "$dest" -type f 2>/dev/null | grep -q .; then
             continue
         fi
-        # 优先用 tag 里记录的固定 commit；master 会漂移（libcork master 已缺 version.h）
-        ref="master"
-        if [[ -n "${SUBMODULE_PIN_336[$name]-}" ]] && [[ -z "$ver" || "$ver" == 3.3.6 ]]; then
-            ref="${SUBMODULE_PIN_336[$name]}"
-        fi
-        info " 补齐子模块 ${name}（release 包内为空目录，来源 ${repo}@${ref:0:8}）"
+        # 按 tag 记录的真实 commit 取件；内置表里任何非法值都不会被使用
+        ref="$(resolve_submodule_ref "$name" "${ver:-3.3.6}")"
+        info " 补齐子模块 ${name}（release 包内为空目录，来源 shadowsocks/${repo}@${ref:0:8}）"
         mkdir -p "$dest"
-        if ! gh_download "${repo}/archive/${ref}.tar.gz" "${dir}/.${name}.tar.gz"; then
-            err " 子模块 ${name} 下载失败"
-            return 1
+        if gh_download "shadowsocks/${repo}/archive/${ref}.tar.gz" "${dir}/.${name}.tar.gz"; then
+            :
+        else
+            # 仓库名可能不同（libipset → ipset 之外的历史命名），再试一次别名
+            alt="${name}"
+            if gh_download "shadowsocks/${alt}/archive/${ref}.tar.gz" "${dir}/.${name}.tar.gz"; then
+                :
+            elif [[ "$ref" != "master" ]] && gh_download "shadowsocks/${repo}/archive/refs/heads/master.tar.gz" "${dir}/.${name}.tar.gz"; then
+                info " 固定 commit 取不到，退回 master"
+            else
+                warn " 子模块 ${name} 下载失败，改用 v3.3.5 归档兜底"
+                submodules_from_335 "$dir" || return 1
+                break
+            fi
         fi
         if ! tar xzf "${dir}/.${name}.tar.gz" --strip-components=1 -C "$dest" 2>>"$LOG_FILE"; then
             err " 子模块 ${name} 解压失败"
@@ -543,7 +623,6 @@ prepare_submodules() {
     [[ "$ok" -eq 1 ]] && ok " 子模块已就绪"
     return $(( ok == 1 ? 0 : 1 ))
 }
-
 # ---------------------------------------------------------------- 依赖安装
 install_deps_base() {
     pkg_refresh
