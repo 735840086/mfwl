@@ -12,6 +12,8 @@
 #   SS_PASSWORD=xxx       非交互指定密码
 #   SS_METHOD=aes-256-gcm 非交互指定加密方式
 #   SS_MIRROR=https://ghfast.top/   强制指定 GitHub 加速前缀（可留空表示直连）
+#   SS_MODE=package      优先用发行版仓库（apt/yum 的 shadowsocks-libev）安装，不编译，适合小内存机器
+#   SS_NO_SWAP=1         内存不足时不自动创建临时 Swap
 #
 
 export LANG=C
@@ -65,6 +67,23 @@ warn() { colorEcho "$YELLOW" " $*"; }
 err()  { colorEcho "$RED" " $*"; }
 die()  { err "$*"; exit 1; }
 
+# 日志文件必须是可写的，否则所有 “2>>$LOG_FILE” 的重定向都会失败，
+# 进而让 curl / apt 这些命令被连带判为失败（本次调试就踩到过）
+log_ready() {
+    local d
+    if { : >>"$LOG_FILE"; } 2>/dev/null; then
+        return 0
+    fi
+    d="$(dirname "$LOG_FILE")"
+    mkdir -p "$d" 2>/dev/null
+    if { : >>"$LOG_FILE"; } 2>/dev/null; then
+        return 0
+    fi
+    LOG_FILE="/tmp/$(basename "$0" .sh).log"
+    { : >>"$LOG_FILE"; } 2>/dev/null || true
+    return 0
+}
+
 # ---------------------------------------------------------------- 系统检查
 checkSystem() {
     if [[ "${EUID}" -ne 0 ]]; then
@@ -117,7 +136,9 @@ _pkg_missing() {
 }
 
 pkg_install() {
+    log_ready
     local -a missing
+    local rc=0
     mapfile -t missing < <(_pkg_missing "$@")
     [[ ${#missing[@]} -eq 0 ]] && return 0
     info " 安装依赖: ${missing[*]}"
@@ -125,12 +146,78 @@ pkg_install() {
         apt) apt-get install -y --no-install-recommends "${missing[@]}" >>"$LOG_FILE" 2>&1 ;;
         dnf) dnf install -y "${missing[@]}" >>"$LOG_FILE" 2>&1 ;;
         yum) yum install -y "${missing[@]}" >>"$LOG_FILE" 2>&1 ;;
-    esac
+    esac || rc=$?
+    if (( rc == 137 )); then
+        err " 进程被 OOM Killer 杀死（内存不足），请先加 Swap 或加内存后重试"
+        return 1
+    fi
+    return "$rc"
 }
 
 pkg_install_opt() {
     # 可选项（二维码等），失败不影响主流程
     pkg_install "$@" || warn " 可选依赖安装失败: $* （不影响使用）"
+}
+
+# ---------------------------------------------------------------- 内存/OOM
+avail_mem_mb() {
+    local kb
+    kb="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)"
+    [[ -n "$kb" ]] || kb="$(awk '/^MemFree:/{print $2}' /proc/meminfo 2>/dev/null)"
+    echo $(( ${kb:-0} / 1024 ))
+}
+
+swap_total_mb() {
+    local kb
+    kb="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
+    echo $(( ${kb:-0} / 1024 ))
+}
+
+ensure_memory() {
+    # 512MB 小机器上 apt / 编译都可能被 OOM Killer 直接 SIGKILL（截断日志、报错却查不出原因）
+    local avail swap ans size
+    avail="$(avail_mem_mb)"
+    swap="$(swap_total_mb)"
+    info " 可用内存 ${avail} MB，Swap ${swap} MB"
+
+    if (( avail >= 600 )); then return 0; fi
+    if (( swap >= 512 )); then
+        warn " 内存偏紧（${avail} MB），已有 Swap ${swap} MB，继续（编译会较慢）"
+        return 0
+    fi
+    warn " 内存不足（${avail} MB 且无 Swap）：apt / make 很可能被 OOM Killer 杀掉"
+    if [[ "${SS_NO_SWAP:-0}" == "1" ]]; then
+        warn " 已按 SS_NO_SWAP=1 跳过 Swap 创建，安装可能失败"
+        return 0
+    fi
+
+    read -r -p " 是否创建 1GB 临时 Swap 供本次安装使用？(y/n，默认 y) " ans
+    [[ -z "$ans" ]] && ans="y"
+    if [[ "${ans,,}" != "y" ]]; then
+        warn " 已跳过 Swap；若安装失败，请先加内存或改用 SS_MODE=package"
+        return 0
+    fi
+
+    size=1024
+    if [[ -f /swapfile ]]; then
+        swapon /swapfile >>"$LOG_FILE" 2>&1 && info " 已启用现有 /swapfile" || warn " 现有 /swapfile 启用失败"
+    else
+        info " 创建 /swapfile (${size} MB)..."
+        if fallocate -l "${size}M" /swapfile 2>/dev/null || \
+           dd if=/dev/zero of=/swapfile bs=1M count=$size status=none 2>/dev/null; then
+            chmod 600 /swapfile
+            if mkswap /swapfile >>"$LOG_FILE" 2>&1 && swapon /swapfile >>"$LOG_FILE" 2>&1; then
+                ok " Swap 已启用（重启后失效；长期使用请自行写入 /etc/fstab）"
+            else
+                warn " Swap 启用失败，已删除临时文件"
+                rm -f /swapfile
+            fi
+        else
+            warn " Swap 文件创建失败（磁盘空间不足？）"
+        fi
+    fi
+    info " 当前可用内存 $(avail_mem_mb) MB，Swap $(swap_total_mb) MB"
+    return 0
 }
 
 # ---------------------------------------------------------------- 公网 IP
@@ -347,6 +434,7 @@ resolve_version() {
 }
 
 gh_download() {
+    log_ready
     # $1: 仓库内相对路径  $2: 输出文件
     local relpath="$1" out="$2" m url
     for m in "${GH_MIRRORS[@]}"; do
@@ -372,6 +460,41 @@ detect_build_system() {
     fi
 }
 
+# v3.3.6 改用 CMake，但 GitHub 的 release 源码包不含子模块，
+# libcork / libipset / libbloom 三个目录是空的，直接 cmake 会报：
+#   CMake Error at CMakeLists.txt:175 (add_library): No SOURCES given to target: bloom
+prepare_submodules() {
+    log_ready
+    local dir="$1" spec name repo dest
+    for spec in "libcork:libcork" "libipset:ipset" "libbloom:libbloom"; do
+        name="${spec%%:*}"
+        repo="shadowsocks/${spec##*:}"
+        dest="${dir}/${name}"
+        if find "$dest" -type f 2>/dev/null | grep -q .; then
+            continue
+        fi
+        info " 补齐子模块 ${name}（release 包内为空目录）"
+        mkdir -p "$dest"
+        if ! gh_download "${repo}/archive/refs/heads/master.tar.gz" "${dir}/.${name}.tar.gz"; then
+            err " 子模块 ${name} 下载失败"
+            return 1
+        fi
+        if ! tar xzf "${dir}/.${name}.tar.gz" --strip-components=1 -C "$dest" 2>>"$LOG_FILE"; then
+            err " 子模块 ${name} 解压失败"
+            return 1
+        fi
+        rm -f "${dir}/.${name}.tar.gz"
+    done
+    local f ok=1
+    for f in "libcork/src/libcork/core/allocator.c" \
+             "libipset/src/libipset/general.c" \
+             "libbloom/bloom.c"; do
+        [[ -f "${dir}/${f}" ]] || { err " 子模块缺少关键文件: ${f}"; ok=0; }
+    done
+    [[ "$ok" -eq 1 ]] && ok " 子模块已就绪"
+    return $(( ok == 1 ? 0 : 1 ))
+}
+
 # ---------------------------------------------------------------- 依赖安装
 install_deps_base() {
     pkg_refresh
@@ -380,46 +503,62 @@ install_deps_base() {
     case "$PM" in
         apt)
             pkg_install curl tar ca-certificates coreutils procps iproute2 \
-                        gcc make autoconf automake libtool pkg-config gettext libssl-dev
+                        gcc make autoconf automake libtool pkg-config gettext libssl-dev || return 1
             pkg_install_opt qrencode
             ;;
         dnf|yum)
             pkg_install curl tar ca-certificates coreutils procps-ng iproute \
-                        gcc gcc-c++ make autoconf automake libtool pkgconfig gettext openssl-devel
+                        gcc gcc-c++ make autoconf automake libtool pkgconfig gettext openssl-devel || return 1
             pkg_install_opt qrencode
             ;;
     esac
+    local c
+    for c in gcc make tar curl; do
+        command -v "$c" >/dev/null 2>&1 || { err " 基础工具缺失: $c（依赖安装可能被 OOM 打断）"; return 1; }
+    done
+    return 0
 }
 
 install_deps_autotools() {
     info " 安装 autotools 构建依赖（libev / libsodium / c-ares / mbedtls / pcre）"
     case "$PM" in
         apt)
-            pkg_install libev-dev libsodium-dev libudns-dev libc-ares-dev libmbedtls-dev
+            pkg_install libev-dev libsodium-dev libudns-dev libc-ares-dev libmbedtls-dev || return 1
             if ! pkg_install libpcre3-dev; then
                 warn " 未找到 PCRE1 开发包（libpcre3-dev），v3.3.5 无法编译；可改用 SS_VER=3.3.6（CMake + PCRE2）"
             fi
             ;;
         dnf|yum)
-            pkg_install libev-devel libsodium-devel udns-devel c-ares-devel mbedtls-devel pcre-devel
+            pkg_install libev-devel libsodium-devel udns-devel c-ares-devel mbedtls-devel pcre-devel || return 1
             ;;
     esac
+    return 0
 }
 
 install_deps_cmake() {
     info " 安装 CMake 构建依赖（libev / libsodium / c-ares / mbedtls / pcre2）"
     case "$PM" in
-        apt) pkg_install cmake libev-dev libsodium-dev libc-ares-dev libmbedtls-dev libpcre2-dev ;;
-        *)   pkg_install cmake libev-devel libsodium-devel c-ares-devel mbedtls-devel pcre2-devel ;;
+        apt) pkg_install cmake libev-dev libsodium-dev libc-ares-dev libmbedtls-dev libpcre2-dev || return 1 ;;
+        *)   pkg_install cmake libev-devel libsodium-devel c-ares-devel mbedtls-devel pcre2-devel || return 1 ;;
     esac
+    return 0
 }
 
 # ---------------------------------------------------------------- 源码编译
 _build() {
-    local dir="$1" bs="$2" jobs
+    log_ready
+    local dir="$1" bs="$2" jobs avail
     jobs="$(nproc 2>/dev/null || echo 2)"
-    [[ "$jobs" -gt 4 ]] && jobs=4
-
+    avail="$(avail_mem_mb)"
+    # 小内存机器并行编译容易 OOM，按可用内存收敛并发
+    if (( avail < 1024 )); then
+        jobs=1
+    elif (( avail < 2048 )); then
+        jobs=2
+    elif (( jobs > 4 )); then
+        jobs=4
+    fi
+    info " 编译并发: -j${jobs}（可用内存 ${avail} MB）"
     case "$bs" in
         autotools)
             info " 构建方式: autotools (configure)"
@@ -449,6 +588,7 @@ _build() {
 }
 
 install_from_source() {
+    log_ready
     local ver="$1" work dir bs
     ver="$(normalize_version "$ver")"
     work="$(mktemp -d /tmp/ss-install.XXXXXX)" || { err " 创建临时目录失败"; return 1; }
@@ -478,9 +618,22 @@ install_from_source() {
     bs="$(detect_build_system "$dir")"
     info " 检测到构建系统: ${bs}（源码来源: ${DL_USED}）"
     case "$bs" in
-        autotools) install_deps_autotools ;;
-        cmake)     install_deps_cmake ;;
-        *)         err " 未知构建系统"; rm -rf "$work"; return 1 ;;
+        autotools)
+            install_deps_autotools || { rm -rf "$work"; return 1; }
+            ;;
+        cmake)
+            install_deps_cmake || { rm -rf "$work"; return 1; }
+            prepare_submodules "$dir" || {
+                err " 子模块补齐失败，v${ver} 无法用 CMake 构建"
+                rm -rf "$work"
+                return 1
+            }
+            ;;
+        *)
+            err " 未知构建系统"
+            rm -rf "$work"
+            return 1
+            ;;
     esac
 
     if ! _build "$dir" "$bs"; then
@@ -502,13 +655,32 @@ install_from_source() {
     return 0
 }
 
+install_from_package() {
+    info " 使用发行版仓库安装（SS_MODE=package）"
+    pkg_install shadowsocks-libev || return 1
+    hash -r
+    export PATH="/usr/bin:/usr/local/bin:${PATH}"
+    SS_BIN="$(command -v ss-server 2>/dev/null)"
+    [[ -n "$SS_BIN" ]] || { err " 仓库安装完成但未找到 ss-server"; return 1; }
+    ok " 已安装: ${SS_BIN}（仓库版本，无需编译）"
+    return 0
+}
+
 install_ss() {
     echo
     info " 安装 SS..."
     : >"$LOG_FILE"
 
+    if [[ "${SS_MODE:-source}" == "package" ]]; then
+        install_from_package || die " 仓库安装失败（可去掉 SS_MODE=package 改用源码编译）"
+        write_service
+        ok " SS 安装完成"
+        return 0
+    fi
+
     resolve_version
-    install_deps_base
+    ensure_memory
+    install_deps_base || die " 基础依赖安装失败（若日志里出现 Killed，即为内存不足），完整日志: ${LOG_FILE}"
 
     if install_from_source "$NEW_VER"; then
         :
