@@ -15,6 +15,7 @@
 #   bash mtproxy.sh status          状态 + 一键链接
 #   bash mtproxy.sh config          改配置
 #   bash mtproxy.sh logs            看日志
+#   bash mtproxy.sh netcheck        网络诊断（监听/出网/防火墙）
 #   bash mtproxy.sh check-tg        检测到 Telegram 的连通性
 #   bash mtproxy.sh uninstall       卸载
 #   bash mtproxy.sh doctor          环境诊断（目录/配置/systemd/日志）
@@ -509,6 +510,9 @@ build_run_cmd() {
             RUN_CMD+=(--bind "0.0.0.0:$PORT")
             RUN_CMD+=(--multiplex-per-connection 500)
             RUN_CMD+=(--prefer-ip=ipv4)
+            if [[ "$PUBLIC_IP" =~ ^[0-9]{1,3}\. && "$PUBLIC_IP" == *.* ]]; then
+                RUN_CMD+=(-4 "$PUBLIC_IP:$PORT")
+            fi
             [[ -n "$localip" ]] && RUN_CMD+=(-t "$localip:$ADMIN_PORT")
             ;;
         3)
@@ -580,6 +584,7 @@ unit_exists() { [[ -f "$UNIT_PATH" ]]; }
 # 这里生成一个只含 exec 命令的落盘包装脚本，配置变更时会自动重写。
 write_runner() {
     load_config 2>/dev/null || return 1
+    get_public_ip >/dev/null 2>&1 || true
     build_run_cmd || return 1
     ensure_dirs
     {
@@ -1156,6 +1161,85 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# 网络连通诊断：本机监听 / 出网到 Telegram / 入站防火墙
+# ---------------------------------------------------------------------------
+tcp_probe() {  # host port timeout
+    timeout "${3:-4}" bash -c "exec 3<>/dev/tcp/$1/$2" >/dev/null 2>&1
+    return $?
+}
+
+netcheck() {
+    load_config 2>/dev/null || true
+    line
+    printf '  %s网络连通诊断%s\n' "$C_BOLD" "$C_END"
+    line
+
+    # 1) 本机是否在监听
+    echo "【1】本机监听"
+    if [[ -z "${PORT:-}" ]]; then
+        err "没有配置（先 install）"
+    else
+        local pids
+        pids=$(port_pids "$PORT" 2>/dev/null | tr '\n' ' ')
+        if [[ -n "$pids" ]]; then
+            info "端口 $PORT 正在监听（pid $pids）"
+        else
+            err "端口 $PORT 没有监听 → 服务没起来，先 restart 看日志"
+        fi
+        [[ -n "${ADMIN_PORT:-}" ]] && printf '     管理端口 %s：%s\n' "$ADMIN_PORT" \
+            "$(port_pids "$ADMIN_PORT" 2>/dev/null | head -1 | sed 's/^/pid /;s/^//')"
+    fi
+
+    # 2) 服务器能否连到 Telegram 的 DC（这一步不通，客户端再怎么弄都连不上）
+    echo
+    echo "【2】服务器 → Telegram DC（出网）"
+    local dcs=("149.154.175.50:443" "149.154.167.51:443" "149.154.175.100:443"
+               "149.154.167.91:443" "91.108.56.130:443")
+    local d okc=0
+    for d in "${dcs[@]}"; do
+        if tcp_probe "${d%%:*}" "${d##*:}" 4; then
+            printf '     %s✓%s %s\n' "$C_GREEN" "$C_END" "$d"; okc=$((okc+1))
+        else
+            printf '     %s✗%s %s\n' "$C_RED" "$C_END" "$d"
+        fi
+    done
+
+    # 3) 本机防火墙
+    echo
+    echo "【3】本机防火墙"
+    local shown=0
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+        shown=1; ufw status 2>/dev/null | sed -n '1,12p' | sed 's/^/     /'
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then
+        shown=1; printf '     firewalld 开放端口: %s\n' "$(firewall-cmd --list-ports 2>/dev/null)"
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        local rules
+        rules=$(iptables -S 2>/dev/null | grep -E "dpt:${PORT:-0}|DROP|REJECT" | head -6)
+        if [[ -n "$rules" ]]; then shown=1; printf '%s\n' "$rules" | sed 's/^/     /'; fi
+    fi
+    [[ $shown -eq 0 ]] && printf '     本机没有生效的防火墙规则（ufw/firewalld 未启用）\n'
+
+    # 4) 结论
+    echo
+    echo "【4】结论"
+    if [[ -n "${PORT:-}" ]] && [[ -z "$(port_pids "$PORT" 2>/dev/null)" ]]; then
+        err "服务没在监听：先 「bash $SELF_NAME restart」，再看 「bash $SELF_NAME logs」"
+    elif [[ $okc -eq 0 ]]; then
+        err "服务器连不上 Telegram 的任何一个 DC → 这台机器到 Telegram 被阻断或者安全组限制出网，客户端必然连不上。换地域/换机器，或改用中转。"
+    elif [[ $okc -lt ${#dcs[@]} ]]; then
+        warn "只有 $okc/${#dcs[@]} 个 DC 可通，可能部分节点抽风，一般仍能用"
+    else
+        info "服务器出网正常"
+    fi
+    printf '     若服务器侧都正常，客户端连不上基本都是「入站被挡」：\n'
+    printf '       · 云厂商安全组（阿里云/腾讯云）必须放行 TCP %s\n' "${PORT:-端口}"
+    printf '       · 部分移动网络会封高端口，可把端口改成 443 再试\n'
+    printf '       · 本机临时验证：ss -lntp | grep %s，再从本地 telnet 该端口\n' "${PORT:-端口}"
+}
+
+# ---------------------------------------------------------------------------
 # 环境诊断（出问题时一条命令看全）
 # ---------------------------------------------------------------------------
 doctor() {
@@ -1248,7 +1332,7 @@ EOF
                     warn "还没安装"
                 fi
                 ;;
-            9) check_tg ;;
+            9) netcheck ;;
             10) uninstall ;;
             0) exit 0 ;;
             *) warn "请输入 0-10" ;;
@@ -1325,6 +1409,7 @@ main() {
         logs)        show_logs "${1:-40}" ;;
         firewall)    load_config && firewall_open "$PORT" ;;
         check-tg|check_tg|tgcheck) check_tg ;;
+        netcheck|net-check|net)     netcheck ;;
         uninstall)   uninstall ;;
         __run)       do_run_foreground ;;
         selftest)    selftest ;;
