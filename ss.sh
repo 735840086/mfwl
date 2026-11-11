@@ -137,7 +137,11 @@ checkSystem() {
         die " 不受支持的 Linux 系统（未找到 apt-get / dnf / yum）"
     fi
     case "$PM" in
-        apt) export DEBIAN_FRONTEND=noninteractive ;;
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            # needrestart 会在每次 apt 结束后扫描全部进程，小内存机器上能多卡好几分钟
+            export NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
+            ;;
     esac
     info " 系统: $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}") / 包管理器: ${PM}"
 }
@@ -171,6 +175,10 @@ run_bg_progress_in() {
 }
 
 pkg_refresh() {
+    if [[ "$PM" == "apt" ]] && [[ -n "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages*' -mmin -60 2>/dev/null | head -1)" ]]; then
+        info " 软件源索引刚更新过，跳过刷新"
+        return 0
+    fi
     case "$PM" in
         apt) run_bg_progress "刷新软件源" timeout 240 apt-get update -qq || warn " 刷新软件源超时/失败，继续尝试安装" ;;
         dnf) dnf makecache -q >"$LOG_FILE" 2>&1 ;;
@@ -210,7 +218,8 @@ pkg_install() {
     case "$PM" in
         apt) run_bg_progress "安装 ${missing[*]}" \
                 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
-                        -o Acquire::https::Timeout=20 \
+                        -o Acquire::https::Timeout=20 -o Dpkg::Lock::Timeout=120 \
+                        -o Dpkg::Use-Pty=0 \
                         install -y --no-install-recommends \
                         -o Dpkg::Options::=--force-confdef \
                         -o Dpkg::Options::=--force-confold "${missing[@]}" ;;
@@ -228,7 +237,11 @@ pkg_install() {
 }
 
 pkg_install_opt() {
-    # 可选项（二维码等），失败不影响主流程
+    # 可选项（二维码等），失败不影响主流程；内存紧张的机器直接跳过，别为了它再拖时间
+    if (( $(avail_mem_mb) < 400 )); then
+        warn " 内存紧张，跳过可选依赖: $*"
+        return 0
+    fi
     pkg_install "$@" || warn " 可选依赖安装失败: $* （不影响使用）"
 }
 
@@ -284,6 +297,8 @@ ensure_memory() {
     fi
 
     size=1024
+    # 可用内存只剩一百来兆时，1GB Swap 也不够 apt 折腾，直接给 2GB
+    if (( avail < 120 )); then size=2048; fi
     if [[ -f /swapfile ]]; then
         swapon /swapfile >>"$LOG_FILE" 2>&1 && info " 已启用现有 /swapfile" || warn " 现有 /swapfile 启用失败"
     else
@@ -825,7 +840,22 @@ install_from_source() {
 
 install_from_package() {
     info " 使用发行版仓库安装（SS_MODE=package）"
-    pkg_install shadowsocks-libev || return 1
+    # 关键顺序：先保证内存/Swap，再去装包。上轮就是在没有 Swap 的情况下直接 apt，
+    # 被 OOM Killer 杀掉（日志里表现为 "Killed"），还被误判成「仓库里没有这个包」
+    ensure_memory || true
+    local rc=0
+    pkg_install shadowsocks-libev; rc=$?
+    if (( rc == 137 )); then
+        warn " 装包时被 OOM Killer 杀死，补建 Swap 后重试一次"
+        SS_NO_SWAP=0 ensure_memory || true
+        pkg_install shadowsocks-libev; rc=$?
+    fi
+    if (( rc == 137 )); then
+        err " 内存确实不够（当前可用 $(avail_mem_mb) MB），装包也会被杀"
+        err " 建议：换 1GB 内存以上的机器，或先把 Swap 加到 2GB 再重试"
+        return 137
+    fi
+    (( rc == 0 )) || return "$rc"
     hash -r
     export PATH="/usr/bin:/usr/local/bin:${PATH}"
     SS_BIN="$(command -v ss-server 2>/dev/null)"
@@ -844,6 +874,10 @@ install_ss() {
     local mode="${SS_MODE:-}" auto_mode=0 mem
     if [[ -z "$mode" ]]; then
         mem="$(avail_mem_mb)"
+        if (( mem > 0 && mem < 120 )); then
+            warn " 系统自身几乎占满内存（可用 ${mem} MB），多半是云助手/监控进程吃掉的"
+            warn " 建议先停掉不必要的服务，或换 1GB 内存以上的机器；脚本会尽量建大 Swap 兜住"
+        fi
         if (( mem > 0 && mem < 700 )) && command -v apt-get >/dev/null 2>&1; then
             mode=package; auto_mode=1
             info " 可用内存 ${mem} MB，自动改用仓库安装（不编译）；想强制编译请设 SS_MODE=source"
@@ -853,13 +887,33 @@ install_ss() {
     fi
 
     if [[ "$mode" == "package" ]]; then
-        if install_from_package; then
+        install_from_package; local prc=$?
+        if (( prc == 0 )); then
             write_service
             ok " SS 安装完成"
             return 0
         fi
+        if (( prc == 137 )); then
+            die " 安装因内存不足被终止，源码编译只会更糟，先解决内存问题再来"
+        fi
+        if grep -qE "Unable to locate package|No matching|has no candidate" "$LOG_FILE" 2>/dev/null; then
+            warn " 当前软件源里没有 shadowsocks-libev 这个包"
+        else
+            warn " 仓库安装没有成功（详情见 ${LOG_FILE}）"
+        fi
         if [[ $auto_mode -eq 1 ]]; then
-            warn " 仓库里没有可用的 shadowsocks-libev，改为源码编译（小机器会比较慢，建议先加内存）"
+            # 自动模式只是"帮你少走弯路"，不代表可以随便退回编译：
+            # 400MB 机器上编译几十分钟还会把机器拖卡，先问一句
+            if [[ -t 0 ]]; then
+                local ans2=""
+                read -r -p " 要改为源码编译吗？小机器可能几十分钟 (y/N，默认 N) " ans2
+                if [[ "${ans2,,}" != "y" ]]; then
+                    die " 已中止。修好软件源后重跑，或用 SS_MODE=source 明确要求编译"
+                fi
+            else
+                die " 仓库安装失败且非交互运行，已中止（可设 SS_MODE=source 强制编译）"
+            fi
+            warn " 改为源码编译；如果只是想要能用，建议先加内存或换台机器"
         else
             die " 仓库安装失败（改用源码编译：SS_MODE=source；或换有该软件包的系统）"
         fi
