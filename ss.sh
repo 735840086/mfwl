@@ -13,8 +13,10 @@
 #   SS_METHOD=aes-256-gcm 非交互指定加密方式
 #   SS_MIRROR=https://ghfast.top/   强制指定 GitHub 加速前缀（可留空表示直连）
 #   SS_MODE=package      用发行版仓库（apt/yum 的 shadowsocks-libev）安装，不编译
-#                        不设置时：可用内存 <700MB 自动选 package，否则源码编译
-#   SS_MODE=source       强制源码编译（想要 3.3.6 新版时用）
+#   SS_MODE=source       源码编译：3.3.6 优先，构建失败自动回滚 3.3.5
+#                        不设置 SS_MODE 时 install 会交互让你选 1)二进制 / 2)编译
+#                        非交互场景下：可用内存 <700MB 自动选 package，否则源码编译
+#   源码编译会临时创建 2GB Swap，安装结束（成功或失败）自动 swapoff + 删除
 #   SS_NO_SWAP=1         内存不足时不自动创建临时 Swap
 #
 
@@ -270,52 +272,87 @@ effective_mem_mb() {
     echo $(( $(avail_mem_mb) + $(swap_free_mb) ))
 }
 
-ensure_memory() {
-    # 512MB 小机器上 apt / 编译都可能被 OOM Killer 直接 SIGKILL（截断日志、报错却查不出原因）
-    local avail swap ans size eff
-    avail="$(avail_mem_mb)"
-    swap="$(swap_total_mb)"
-    eff="$(effective_mem_mb)"
-    info " 可用内存 ${avail} MB，Swap ${swap} MB（合计可用 ${eff} MB）"
+SWAP_TEMP_CREATED=0
 
-    if (( eff >= 600 )); then return 0; fi
-    if (( swap >= 512 )); then
-        warn " 内存偏紧（${avail} MB），已有 Swap ${swap} MB，继续（编译会较慢）"
+swap_in_fstab() {
+    grep -qE "[[:space:]]/swapfile[[:space:]]" /etc/fstab 2>/dev/null
+}
+
+create_temp_swap() {
+    local mb="$1"
+    if [[ -f /swapfile ]] && swap_in_fstab; then
+        warn " /swapfile 已在 /etc/fstab 登记，属于永久 Swap，脚本不修改也不回收"
+        swapon /swapfile >>"$LOG_FILE" 2>&1 || true
         return 0
     fi
-    warn " 内存不足（${avail} MB 且无 Swap）：apt / make 很可能被 OOM Killer 杀掉"
-    if [[ "${SS_NO_SWAP:-0}" == "1" ]]; then
-        warn " 已按 SS_NO_SWAP=1 跳过 Swap 创建，安装可能失败"
-        return 0
-    fi
-
-    read -r -p " 是否创建 1GB 临时 Swap 供本次安装使用？(y/n，默认 y) " ans
-    [[ -z "$ans" ]] && ans="y"
-    if [[ "${ans,,}" != "y" ]]; then
-        warn " 已跳过 Swap；若安装失败，请先加内存或改用 SS_MODE=package"
-        return 0
-    fi
-
-    size=1024
-    # 可用内存只剩一百来兆时，1GB Swap 也不够 apt 折腾，直接给 2GB
-    if (( avail < 120 )); then size=2048; fi
     if [[ -f /swapfile ]]; then
-        swapon /swapfile >>"$LOG_FILE" 2>&1 && info " 已启用现有 /swapfile" || warn " 现有 /swapfile 启用失败"
-    else
-        info " 创建 /swapfile (${size} MB)..."
-        if fallocate -l "${size}M" /swapfile 2>/dev/null || \
-           dd if=/dev/zero of=/swapfile bs=1M count=$size status=none 2>/dev/null; then
-            chmod 600 /swapfile
-            if mkswap /swapfile >>"$LOG_FILE" 2>&1 && swapon /swapfile >>"$LOG_FILE" 2>&1; then
-                ok " Swap 已启用（重启后失效；长期使用请自行写入 /etc/fstab）"
-            else
-                warn " Swap 启用失败，已删除临时文件"
-                rm -f /swapfile
-            fi
+        # 上一轮留下的临时文件：先摘掉，再按本次需要的容量重建
+        if swapoff /swapfile >>"$LOG_FILE" 2>&1; then
+            rm -f /swapfile
         else
-            warn " Swap 文件创建失败（磁盘空间不足？）"
+            warn " 旧 /swapfile 里还有数据，swapoff 失败；本次沿用现有 Swap $(swap_total_mb) MB"
+            return 0
         fi
     fi
+    info " 创建临时 Swap ${mb} MB（装完自动回收，不写 /etc/fstab）"
+    if fallocate -l "${mb}M" /swapfile 2>/dev/null || \
+       dd if=/dev/zero of=/swapfile bs=1M count="$mb" status=none 2>/dev/null; then
+        chmod 600 /swapfile
+        if mkswap /swapfile >>"$LOG_FILE" 2>&1 && swapon /swapfile >>"$LOG_FILE" 2>&1; then
+            SWAP_TEMP_CREATED=1
+            ok " 临时 Swap 已启用"
+        else
+            warn " Swap 启用失败，已删除临时文件"
+            rm -f /swapfile
+        fi
+    else
+        warn " Swap 文件创建失败（磁盘空间不足？）"
+    fi
+}
+
+cleanup_temp_swap() {
+    (( SWAP_TEMP_CREATED == 1 )) || return 0
+    local used=$(( $(swap_total_mb) - $(swap_free_mb) ))
+    info " 回收临时 Swap（当前占用 ${used} MB）"
+    if swapoff /swapfile >>"$LOG_FILE" 2>&1; then
+        rm -f /swapfile
+        SWAP_TEMP_CREATED=0
+        info " 已回收：可用内存 $(avail_mem_mb) MB，Swap $(swap_total_mb) MB"
+    else
+        # 页面还没搬回内存时 swapoff 会失败，硬删文件会让内核拿着一个已删除的 swap 设备
+        warn " Swap 仍在使用，swapoff 未成功：保留 /swapfile"
+        warn " 稍后手动回收：swapoff /swapfile && rm -f /swapfile"
+    fi
+}
+
+# want: 目标可用内存（MB）。装包 1024，源码编译 2048
+ensure_memory() {
+    local want="${1:-1024}"
+    local avail swap eff ans
+    avail="$(avail_mem_mb)"; swap="$(swap_total_mb)"; eff="$(effective_mem_mb)"
+    info " 可用内存 ${avail} MB，Swap ${swap} MB（合计可用 ${eff} MB）"
+
+    if (( eff >= want )); then return 0; fi
+    # 可用内存只剩一百来兆时，1GB 也不够折腾，直接给 2GB
+    if (( avail < 120 && want < 2048 )); then want=2048; fi
+    if (( swap >= want - 100 )); then
+        warn " 内存偏紧（${avail} MB），已有 Swap ${swap} MB，继续（会比较慢）"
+        return 0
+    fi
+    warn " 内存不足（可用 ${avail} MB，合计 ${eff} MB，目标 ${want} MB）"
+    if [[ "${SS_NO_SWAP:-0}" == "1" ]]; then
+        warn " 已按 SS_NO_SWAP=1 跳过临时 Swap，安装可能被 OOM Killer 杀掉"
+        return 0
+    fi
+    if [[ -t 0 ]]; then
+        read -r -p " 是否创建 ${want} MB 临时 Swap 供本次安装使用（装完自动回收）？(y/n，默认 y) " ans
+        [[ -z "$ans" ]] && ans="y"
+        if [[ "${ans,,}" != "y" ]]; then
+            warn " 已跳过；若安装失败，请先加内存或改用发行版仓库安装"
+            return 0
+        fi
+    fi
+    create_temp_swap "$want"
     info " 当前可用内存 $(avail_mem_mb) MB，Swap $(swap_total_mb) MB（合计 $(effective_mem_mb) MB）"
     return 0
 }
@@ -842,12 +879,12 @@ install_from_package() {
     info " 使用发行版仓库安装（SS_MODE=package）"
     # 关键顺序：先保证内存/Swap，再去装包。上轮就是在没有 Swap 的情况下直接 apt，
     # 被 OOM Killer 杀掉（日志里表现为 "Killed"），还被误判成「仓库里没有这个包」
-    ensure_memory || true
+    ensure_memory 1024 || true
     local rc=0
     pkg_install shadowsocks-libev; rc=$?
     if (( rc == 137 )); then
         warn " 装包时被 OOM Killer 杀死，补建 Swap 后重试一次"
-        SS_NO_SWAP=0 ensure_memory || true
+        SS_NO_SWAP=0 ensure_memory 2048 || true
         pkg_install shadowsocks-libev; rc=$?
     fi
     if (( rc == 137 )); then
@@ -869,26 +906,53 @@ install_ss() {
     info " 安装 SS..."
     : >"$LOG_FILE"
 
-    # 400MB 级别的小机器上，apt + 编译能跑几十分钟，还会因为不停换页把整机拖卡。
-    # 可用内存很小的时候默认改走发行版仓库（二进制直装，通常 1 分钟内完成）。
-    local mode="${SS_MODE:-}" auto_mode=0 mem
+    # 两种路子：仓库直装二进制（快）/ 源码编译（默认 3.3.6，失败回滚 3.3.5）
+    local mode="${SS_MODE:-}" auto_mode=0 mem ans1 def
+    mem="$(avail_mem_mb)"
+
     if [[ -z "$mode" ]]; then
-        mem="$(avail_mem_mb)"
         if (( mem > 0 && mem < 120 )); then
             warn " 系统自身几乎占满内存（可用 ${mem} MB），多半是云助手/监控进程吃掉的"
             warn " 建议先停掉不必要的服务，或换 1GB 内存以上的机器；脚本会尽量建大 Swap 兜住"
         fi
-        if (( mem > 0 && mem < 700 )) && command -v apt-get >/dev/null 2>&1; then
-            mode=package; auto_mode=1
-            info " 可用内存 ${mem} MB，自动改用仓库安装（不编译）；想强制编译请设 SS_MODE=source"
+
+        if [[ -t 0 ]]; then
+            echo
+            echo " 选择安装方式:"
+            echo "   1) 发行版仓库直装二进制 —— 快，约 1 分钟；版本跟随发行版（一般 3.3.5 左右）"
+            echo "   2) 源码编译 —— 3.3.6 优先，构建失败自动回滚 3.3.5；先临时建 2GB Swap，装完自动回收"
+            def=1
+            (( mem >= 700 )) && def=2
+            read -r -p " 请选择 (1/2，默认 ${def}): " ans1
+            [[ -z "$ans1" ]] && ans1="$def"
+            case "$ans1" in
+                1) mode=package ;;
+                2) mode=source ;;
+                *)
+                    warn " 输入无效（${ans1}），按默认 ${def} 处理"
+                    if (( def == 1 )); then mode=package; else mode=source; fi
+                    ;;
+            esac
+            if [[ "$mode" == "package" ]]; then
+                info " 已选择：发行版仓库安装（不编译）"
+            else
+                info " 已选择：源码编译（目标 3.3.6，失败回滚 3.3.5）"
+            fi
         else
-            mode=source
+            if (( mem > 0 && mem < 700 )) && command -v apt-get >/dev/null 2>&1; then
+                mode=package; auto_mode=1
+                info " 可用内存 ${mem} MB，自动改用仓库安装（不编译）"
+            else
+                mode=source
+            fi
         fi
     fi
 
     if [[ "$mode" == "package" ]]; then
-        install_from_package; local prc=$?
+        local prc=0
+        install_from_package; prc=$?
         if (( prc == 0 )); then
+            cleanup_temp_swap
             write_service
             ok " SS 安装完成"
             return 0
@@ -902,12 +966,11 @@ install_ss() {
             warn " 仓库安装没有成功（详情见 ${LOG_FILE}）"
         fi
         if [[ $auto_mode -eq 1 ]]; then
-            # 自动模式只是"帮你少走弯路"，不代表可以随便退回编译：
-            # 400MB 机器上编译几十分钟还会把机器拖卡，先问一句
             if [[ -t 0 ]]; then
                 local ans2=""
                 read -r -p " 要改为源码编译吗？小机器可能几十分钟 (y/N，默认 N) " ans2
                 if [[ "${ans2,,}" != "y" ]]; then
+                    cleanup_temp_swap
                     die " 已中止。修好软件源后重跑，或用 SS_MODE=source 明确要求编译"
                 fi
             else
@@ -920,7 +983,8 @@ install_ss() {
     fi
 
     resolve_version
-    ensure_memory
+    # 源码编译：先按 2GB 目标准备 Swap（不够就建，装完统一回收）
+    ensure_memory 2048
     install_deps_base || die " 基础依赖安装失败（若日志里出现 Killed，即为内存不足），完整日志: ${LOG_FILE}"
 
     if install_from_source "$NEW_VER"; then
@@ -932,6 +996,7 @@ install_ss() {
         die " SS 安装失败，完整日志: ${LOG_FILE}"
     fi
 
+    cleanup_temp_swap
     write_service
     ok " SS 安装完成"
 }
