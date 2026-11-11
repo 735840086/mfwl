@@ -1,30 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# MTProxy 一键部署 / 管理脚本（整合版）
-#
-# 定位：把 ellermister/mtproxy 的「Fake TLS」用法收敛成单文件脚本，
-#       不依赖 web.sh / caddy / tproxy-server，只保留三种可用实现：
-#         1) MTProxy   Telegram 官方 mtproto-proxy（仅 amd64）
-#         2) mtg       9seconds 的 Go 实现（推荐，单文件静态二进制）
-#         3) mtprotoproxy  alexbers 的 Python 实现（无可用二进制时的退路）
-#
-# 用法：
-#   bash mtproxy.sh                 交互菜单
-#   bash mtproxy.sh install         安装（交互填参数）
-#   bash mtproxy.sh start|stop|restart
-#   bash mtproxy.sh status          状态 + 一键链接
-#   bash mtproxy.sh config          改配置
-#   bash mtproxy.sh logs            看日志
-#   bash mtproxy.sh netcheck        网络诊断（监听/出网/防火墙）
-#   bash mtproxy.sh check-tg        检测到 Telegram 的连通性
-#   bash mtproxy.sh uninstall       卸载
-#   bash mtproxy.sh doctor          环境诊断（目录/配置/systemd/日志）
-#   bash mtproxy.sh selftest        本地自检（不联网、不改系统）
-#
-# 非交互安装：
-#   bash mtproxy.sh install --port 8443 --admin-port 8888 \
-#        --domain cloudflare.com --provider 2 --tag "" --secret ""
-#   --no-systemd 强制用 nohup 后台方式；--force 跳过端口占用确认
+# MTProxy 一键部署 / 管理脚本
 # =============================================================================
 
 set -uo pipefail
@@ -59,7 +35,7 @@ fi
 mkdir -p "$SCRIPT_DIR" 2>/dev/null && chmod 700 "$SCRIPT_DIR" 2>/dev/null
 
 # 脚本放在 / 或系统 bin 目录下时，BIN_DIR 会变成 /bin、配置写到 /config，
-# systemd 的 ExecStart 也会拼出 //xxx 这种路径 —— 直接拦掉，要求独立目录
+# systemd 的 ExecStart 
 if [[ -z "${MTPROXY_HOME:-}" && $PIPE_MODE -eq 0 ]]; then
     case "$SCRIPT_DIR" in
         /|/bin|/sbin|/usr/bin|/usr/sbin|/etc|/usr|/usr/local/bin)
@@ -120,7 +96,7 @@ warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_END" "$*"; }
 err()  { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_END" "$*" >&2; }
 die()  { line >&2; err "$*"; line >&2; exit 1; }
 subject()     { printf '\n%s> %s%s\n' "$C_GREEN" "$*" "$C_END"; }
-# 交互取值时提示必须走 stderr，否则会被 $( ) 一起捕获进变量（原实现就踩了这个坑）
+# 交互取值时提示必须走 stderr
 subject_e()   { subject "$@" >&2; }
 warn_e()      { warn "$@" >&2; }
 info_e()      { info "$@" >&2; }
@@ -130,7 +106,7 @@ info_e()      { info "$@" >&2; }
 # ---------------------------------------------------------------------------
 ensure_dirs() {
     mkdir -p "$BIN_DIR" "$RUN_DIR/pid" "$LOG_DIR" 2>/dev/null || true
-    # 运行目录里有 secret，日志里有 mtg 打印的完整配置，不能让同机其它用户读到
+    # 运行目录里有 secret，日志里有 mtg 打印的完整配置
     chmod 700 "$RUN_DIR" "$LOG_DIR" 2>/dev/null || true
     if [[ ! -f "$RUN_LOG" ]]; then : >"$RUN_LOG" 2>/dev/null || true; fi
     chmod 600 "$RUN_LOG" "$PID_FILE" 2>/dev/null || true
@@ -330,7 +306,7 @@ kill_port_owner() {
 }
 
 # ---------------------------------------------------------------------------
-# 配置读写（不用 source，避免配置文件被塞入任意命令）
+# 配置读写
 # ---------------------------------------------------------------------------
 cfg_get() {
     local key="$1" file="${2:-$CONFIG_FILE}" raw
@@ -494,7 +470,7 @@ do_install_provider() {
 }
 
 # ---------------------------------------------------------------------------
-# 运行命令（统一入口，前台 exec，供 systemd / nohup 复用）
+# 运行命令
 # ---------------------------------------------------------------------------
 build_run_cmd() {
     RUN_CMD=()
@@ -862,7 +838,7 @@ ask_provider() {
     local def="$1" val arch
     arch=$(arch_tag)
     while true; do
-        subject_e "选择实现"
+        subject_e "选择实现版本（1.MTProxy-amd64官方版）（2.mtg-Go单文件，默认推荐）（3.mtprotoproxy-Python3）"
         if [[ "$arch" == "amd64" ]]; then
             printf '  %s1.%s MTProxy 官方版（仅 amd64，问题较多）\n' "$C_CYAN" "$C_END"
         else
