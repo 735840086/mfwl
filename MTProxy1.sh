@@ -31,11 +31,35 @@ set -uo pipefail
 # ---------------------------------------------------------------------------
 # 基础路径 / 全局变量
 # ---------------------------------------------------------------------------
-SELF_NAME=$(basename -- "$0")
-SCRIPT_DIR=${MTPROXY_HOME:-$(cd -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd -P)}
+# 三种运行方式，安装目录不同：
+#   1) bash /root/mtproxy/mtproxy.sh   → 安装目录 = 脚本所在目录
+#   2) bash <(curl -sSL ...)           → $0 是 /dev/fd/63，没有落盘文件，安装目录固定 /root/mtproxy
+#   3) MTPROXY_HOME=/tmp/x bash ...    → 安装目录 = 指定值（测试用）
+_raw_self=$(readlink -f -- "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true)
+SELF_NAME=$(basename -- "${_raw_self:-$0}")
+_base_name=$(basename -- "${_raw_self:-mtproxy.sh}")
+_is_shell=0
+case "$_base_name" in bash|sh|dash|zsh|ash) _is_shell=1 ;; esac
+
+PIPE_MODE=0
+SCRIPT_PATH=""
+if [[ -n "${MTPROXY_HOME:-}" ]]; then
+    SCRIPT_DIR="$MTPROXY_HOME"
+elif [[ -z "$_raw_self" || ! -f "$_raw_self" || "$_raw_self" == /proc/*/fd/* \
+      || "$_raw_self" == /dev/fd/* || "$_is_shell" -eq 1 ]]; then
+    PIPE_MODE=1
+    SELF_NAME=mtproxy.sh
+    if [[ ${EUID:-0} -eq 0 ]]; then SCRIPT_DIR=/root/mtproxy; else SCRIPT_DIR=${HOME:-/root}/mtproxy; fi
+else
+    SCRIPT_DIR=$(dirname -- "$_raw_self")
+    SCRIPT_PATH="$_raw_self"
+fi
+
+mkdir -p "$SCRIPT_DIR" 2>/dev/null && chmod 700 "$SCRIPT_DIR" 2>/dev/null
+
 # 脚本放在 / 或系统 bin 目录下时，BIN_DIR 会变成 /bin、配置写到 /config，
 # systemd 的 ExecStart 也会拼出 //xxx 这种路径 —— 直接拦掉，要求独立目录
-if [[ -z "${MTPROXY_HOME:-}" ]]; then
+if [[ -z "${MTPROXY_HOME:-}" && $PIPE_MODE -eq 0 ]]; then
     case "$SCRIPT_DIR" in
         /|/bin|/sbin|/usr/bin|/usr/sbin|/etc|/usr|/usr/local/bin)
             printf '\033[31m[ERROR]\033[0m 脚本不能放在 %s 下运行（会把程序装进系统目录）。\n' "$SCRIPT_DIR" >&2
@@ -43,10 +67,10 @@ if [[ -z "${MTPROXY_HOME:-}" ]]; then
             exit 1
             ;;
     esac
-    if [[ ! -w "$SCRIPT_DIR" ]]; then
-        printf '\033[31m[ERROR]\033[0m 目录不可写：%s（需要 root 或换目录）\n' "$SCRIPT_DIR" >&2
-        exit 1
-    fi
+fi
+if [[ ! -w "$SCRIPT_DIR" ]]; then
+    printf '\033[31m[ERROR]\033[0m 目录不可写：%s（需要 root 或换目录）\n' "$SCRIPT_DIR" >&2
+    exit 1
 fi
 BIN_DIR="$SCRIPT_DIR/bin"
 RUN_DIR="$SCRIPT_DIR/runtime"
@@ -55,6 +79,7 @@ PID_FILE="$RUN_DIR/mtproxy.pid"
 CONFIG_FILE="$SCRIPT_DIR/config"
 IP_CACHE="$RUN_DIR/public_ip"
 RUN_LOG="$LOG_DIR/run.log"
+RUNNER_FILE="$RUN_DIR/run.sh"
 UNIT_PATH=/etc/systemd/system/mtproxy.service
 UNIT_NAME=mtproxy.service
 
@@ -551,8 +576,32 @@ do_run_foreground() {
 # ---------------------------------------------------------------------------
 unit_exists() { [[ -f "$UNIT_PATH" ]]; }
 
+# 流式运行（bash <(curl ...)）时没有实体脚本文件，systemd 无法用「脚本 + __run」的方式启动。
+# 这里生成一个只含 exec 命令的落盘包装脚本，配置变更时会自动重写。
+write_runner() {
+    load_config 2>/dev/null || return 1
+    build_run_cmd || return 1
+    ensure_dirs
+    {
+        printf '#!/bin/bash\n'
+        printf '# 由 mtproxy-fixed.sh 自动生成，改配置后会自动重写，不要手改\n'
+        printf 'exec'
+        printf ' %q' "${RUN_CMD[@]}"
+        printf '\n'
+    } >"$RUNNER_FILE"
+    chmod 700 "$RUNNER_FILE"
+}
+
 systemd_install() {
     have_systemd || return 1
+    local exec_line
+    if [[ -n "${SCRIPT_PATH:-}" ]]; then
+        exec_line="/bin/bash ${SCRIPT_PATH} __run"
+    else
+        # 流式运行：没有实体脚本，改用生成的 exec 包装
+        write_runner || { err "生成启动包装失败（缺少二进制？）"; return 1; }
+        exec_line="/bin/bash ${RUNNER_FILE}"
+    fi
     cat >"$UNIT_PATH" <<EOF
 [Unit]
 Description=MTProxy ($(provider_name "$PROVIDER")) Fake TLS
@@ -562,7 +611,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=$SCRIPT_DIR
-ExecStart=/bin/bash "${SCRIPT_DIR}/${SELF_NAME}" __run
+ExecStart=${exec_line}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
@@ -1213,7 +1262,31 @@ EOF
 # 参数解析 / 入口
 # ---------------------------------------------------------------------------
 usage() {
-    sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+    # 流式运行（bash <(curl ...)）时 $0 不是文件，读不了自身头部的注释
+    if [[ -n "${SCRIPT_PATH:-}" && -f "$SCRIPT_PATH" ]]; then
+        sed -n '3,30p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
+        return 0
+    fi
+    cat <<'USAGE'
+MTProxy 一键部署 / 管理脚本
+
+用法：
+  bash mtproxy.sh                交互菜单
+  bash mtproxy.sh install        安装（交互填参数）
+  bash mtproxy.sh start|stop|restart
+  bash mtproxy.sh status         状态 + 一键链接
+  bash mtproxy.sh config         改配置
+  bash mtproxy.sh logs           看日志
+  bash mtproxy.sh check-tg       检测到 Telegram 的连通性
+  bash mtproxy.sh uninstall      卸载
+  bash mtproxy.sh doctor         环境诊断
+  bash mtproxy.sh selftest       本地自检
+
+非交互安装：
+  bash mtproxy.sh install --port 8443 --admin-port 8888 \
+       --domain cloudflare.com --provider 2 --yes
+  可选：--tag "" --secret "" --no-systemd --force
+USAGE
 }
 
 parse_install_flags() {
