@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # shadowsocks-libev 一键安装脚本（修复版）
+# 原始脚本来源: https://storage.googleapis.com/tiziblog/ss.sh (作者: 梯子博客)
 # 本版本修复了原脚本导致「有时安装失败 / 装完服务起不来」的一系列问题，
 # 详细对照见同目录《ss-脚本问题分析与修复报告.md》
 #
@@ -11,7 +12,9 @@
 #   SS_PASSWORD=xxx       非交互指定密码
 #   SS_METHOD=aes-256-gcm 非交互指定加密方式
 #   SS_MIRROR=https://ghfast.top/   强制指定 GitHub 加速前缀（可留空表示直连）
-#   SS_MODE=package      优先用发行版仓库（apt/yum 的 shadowsocks-libev）安装，不编译，适合小内存机器
+#   SS_MODE=package      用发行版仓库（apt/yum 的 shadowsocks-libev）安装，不编译
+#                        不设置时：可用内存 <700MB 自动选 package，否则源码编译
+#   SS_MODE=source       强制源码编译（想要 3.3.6 新版时用）
 #   SS_NO_SWAP=1         内存不足时不自动创建临时 Swap
 #
 
@@ -139,9 +142,37 @@ checkSystem() {
     info " 系统: $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}") / 包管理器: ${PM}"
 }
 
+# 长时间命令：后台跑 + 每 4 秒刷新一行进度（终端里能看到在动，不会像卡死）
+# 非交互（输出被管道接走）时不打进度，避免污染返回值
+run_bg_progress() {
+    local label="$1"; shift
+    local start elapsed last pid rc
+    start=$(date +%s)
+    "$@" >>"$LOG_FILE" 2>&1 &
+    pid=$!
+    if [[ -t 1 ]]; then
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 4
+            kill -0 "$pid" 2>/dev/null || break
+            elapsed=$(( $(date +%s) - start ))
+            last=$(tail -n 1 "$LOG_FILE" 2>/dev/null | tr -d '\r' | tr -s ' ' | cut -c1-66)
+            printf '\r    %s… %ss  %-66.66s' "$label" "$elapsed" "$last"
+        done
+        printf '\r%*s\r' 90 ''
+    fi
+    wait "$pid"
+    rc=$?
+    return "$rc"
+}
+
+run_bg_progress_in() {
+    local dir="$1" label="$2"; shift 2
+    run_bg_progress "$label" bash -c 'cd "$1" || exit 1; shift; exec "$@"' _ "$dir" "$@"
+}
+
 pkg_refresh() {
     case "$PM" in
-        apt) apt-get update -qq >"$LOG_FILE" 2>&1 ;;
+        apt) run_bg_progress "刷新软件源" timeout 240 apt-get update -qq || warn " 刷新软件源超时/失败，继续尝试安装" ;;
         dnf) dnf makecache -q >"$LOG_FILE" 2>&1 ;;
         yum) yum makecache -q >"$LOG_FILE" 2>&1 ;;
     esac
@@ -174,11 +205,21 @@ pkg_install() {
     mapfile -t missing < <(_pkg_missing "$@")
     [[ ${#missing[@]} -eq 0 ]] && return 0
     info " 安装依赖: ${missing[*]}"
+    local t0
+    t0=$(date +%s)
     case "$PM" in
-        apt) apt-get install -y --no-install-recommends "${missing[@]}" >>"$LOG_FILE" 2>&1 ;;
-        dnf) dnf install -y "${missing[@]}" >>"$LOG_FILE" 2>&1 ;;
-        yum) yum install -y "${missing[@]}" >>"$LOG_FILE" 2>&1 ;;
+        apt) run_bg_progress "安装 ${missing[*]}" \
+                apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+                        -o Acquire::https::Timeout=20 \
+                        install -y --no-install-recommends \
+                        -o Dpkg::Options::=--force-confdef \
+                        -o Dpkg::Options::=--force-confold "${missing[@]}" ;;
+        dnf) run_bg_progress "安装 ${missing[*]}" dnf install -y "${missing[@]}" ;;
+        yum) run_bg_progress "安装 ${missing[*]}" yum install -y "${missing[@]}" ;;
     esac || rc=$?
+    if (( rc == 0 )); then
+        info " 依赖安装完成（用时 $(( $(date +%s) - t0 ))s）"
+    fi
     if (( rc == 137 )); then
         err " 进程被 OOM Killer 杀死（内存不足），请先加 Swap 或加内存后重试"
         return 1
@@ -689,21 +730,21 @@ _build() {
     case "$bs" in
         autotools)
             info " 构建方式: autotools (configure)"
-            ( cd "$dir" && ./configure --prefix="$PREFIX" --disable-documentation ) >>"$LOG_FILE" 2>&1 || {
+            run_bg_progress_in "$dir" "configure" ./configure --prefix="$PREFIX" --disable-documentation || {
                 err " configure 失败"; tail -n 20 "$LOG_FILE"; return 1; }
-            ( cd "$dir" && make -j"$jobs" ) >>"$LOG_FILE" 2>&1 || {
+            run_bg_progress_in "$dir" "make -j${jobs}" make -j"$jobs" || {
                 err " make 失败"; tail -n 20 "$LOG_FILE"; return 1; }
-            ( cd "$dir" && make install ) >>"$LOG_FILE" 2>&1 || {
+            run_bg_progress_in "$dir" "make install" make install || {
                 err " make install 失败"; tail -n 20 "$LOG_FILE"; return 1; }
             ;;
         cmake)
             info " 构建方式: cmake"
             # WITH_STATIC=ON 需要 .a 静态库，多数发行版不提供，故关闭；EMBEDDED_SRC 打开以使用自带 libcork/libipset/libbloom
-            ( cd "$dir" && cmake -DCMAKE_INSTALL_PREFIX="$PREFIX" -DWITH_STATIC=OFF -DWITH_EMBEDDED_SRC=ON . ) >>"$LOG_FILE" 2>&1 || {
+            run_bg_progress_in "$dir" "cmake 配置" cmake -DCMAKE_INSTALL_PREFIX="$PREFIX" -DWITH_STATIC=OFF -DWITH_EMBEDDED_SRC=ON . || {
                 err " cmake 配置失败"; tail -n 20 "$LOG_FILE"; return 1; }
-            ( cd "$dir" && make -j"$jobs" ) >>"$LOG_FILE" 2>&1 || {
+            run_bg_progress_in "$dir" "make -j${jobs}" make -j"$jobs" || {
                 err " make 失败"; tail -n 20 "$LOG_FILE"; return 1; }
-            ( cd "$dir" && make install ) >>"$LOG_FILE" 2>&1 || {
+            run_bg_progress_in "$dir" "make install" make install || {
                 err " make install 失败"; tail -n 20 "$LOG_FILE"; return 1; }
             ;;
         *)
@@ -798,11 +839,30 @@ install_ss() {
     info " 安装 SS..."
     : >"$LOG_FILE"
 
-    if [[ "${SS_MODE:-source}" == "package" ]]; then
-        install_from_package || die " 仓库安装失败（可去掉 SS_MODE=package 改用源码编译）"
-        write_service
-        ok " SS 安装完成"
-        return 0
+    # 400MB 级别的小机器上，apt + 编译能跑几十分钟，还会因为不停换页把整机拖卡。
+    # 可用内存很小的时候默认改走发行版仓库（二进制直装，通常 1 分钟内完成）。
+    local mode="${SS_MODE:-}" auto_mode=0 mem
+    if [[ -z "$mode" ]]; then
+        mem="$(avail_mem_mb)"
+        if (( mem > 0 && mem < 700 )) && command -v apt-get >/dev/null 2>&1; then
+            mode=package; auto_mode=1
+            info " 可用内存 ${mem} MB，自动改用仓库安装（不编译）；想强制编译请设 SS_MODE=source"
+        else
+            mode=source
+        fi
+    fi
+
+    if [[ "$mode" == "package" ]]; then
+        if install_from_package; then
+            write_service
+            ok " SS 安装完成"
+            return 0
+        fi
+        if [[ $auto_mode -eq 1 ]]; then
+            warn " 仓库里没有可用的 shadowsocks-libev，改为源码编译（小机器会比较慢，建议先加内存）"
+        else
+            die " 仓库安装失败（改用源码编译：SS_MODE=source；或换有该软件包的系统）"
+        fi
     fi
 
     resolve_version
@@ -1204,7 +1264,7 @@ menu() {
     clear
     echo "#############################################################"
     printf '#              %bShadowsocks/SS 一键安装脚本%b                #\n' "$RED" "$PLAIN"
-    printf '# %b3.3.6%b（原: 3.3.5）                          #\n' "$GREEN" "$PLAIN"
+    printf '# %b修复版%b（原脚本来源: tizi.blog）                          #\n' "$GREEN" "$PLAIN"
     echo "#############################################################"
     echo
     printf '  %b1.%b  安装 SS\n' "$GREEN" "$PLAIN"
