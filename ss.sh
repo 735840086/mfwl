@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 #
-# shadowsocks-libev 一键安装脚本（修复版）
-# 原始脚本来源: https://storage.googleapis.com/tiziblog/ss.sh (作者: 梯子博客)
-# 本版本修复了原脚本导致「有时安装失败 / 装完服务起不来」的一系列问题，
-# 详细对照见同目录《ss-脚本问题分析与修复报告.md》
+# shadowsocks-libev 一键安装脚本
 #
 # 用法: bash ss-fixed.sh [menu|install|update|uninstall|start|restart|stop|showInfo|showQR|showLog|check]
 # 可选环境变量:
@@ -1382,8 +1379,8 @@ check() {
 menu() {
     clear
     echo "#############################################################"
-    printf '#              %bShadowsocks/SS 一键安装脚本%b                #\n' "$RED" "$PLAIN"
-    printf '# %b修复版%b（原脚本来源: tizi.blog）                          #\n' "$GREEN" "$PLAIN"
+    printf '#              %bShadowsocks/SS 安装脚本%b                #\n' "$RED" "$PLAIN"
+    printf '# %blibev%b（3.3.5-3.3.6）                          #\n' "$GREEN" "$PLAIN"
     echo "#############################################################"
     echo
     printf '  %b1.%b  安装 SS\n' "$GREEN" "$PLAIN"
